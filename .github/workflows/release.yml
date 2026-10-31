@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        default: 'latest'
+        description: 'Package version'
+        type: string
+        required: true
+  schedule:
+    - cron: '0 20 * * *'
+
+env:
+  app_name: 'corefile-tool'
+  app_repo: 'coredns/corefile-migration'
+
+jobs:
+  check:
+    runs-on: ubuntu-slim
+    outputs:
+      app_version: ${{ steps.get-version.outputs.app_version }}
+      app_build: ${{ steps.check-release.outputs.app_build }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Get Version
+        id: get-version
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event.inputs.version }}" = "latest" ]; then
+            app_version=$(curl -s "https://api.github.com/repos/${{ env.app_repo }}/releases/latest" | jq -r .tag_name)
+          else
+            app_version=${{ github.event.inputs.version }}
+          fi
+          if [ -z "${app_version}" ] || [ "${app_version}" == "null" ]; then
+            echo "Failed to get version"
+            exit 1
+          fi
+          
+          echo "app_version=${app_version}" >> $GITHUB_ENV
+          echo "app_version=${app_version}" >> $GITHUB_OUTPUT
+          echo ""
+          echo "========== Build Args =========="
+          echo "app_version=${app_version}"
+
+      - name: Check Release
+        id: check-release
+        run: |
+          gh release view ${app_version} -R ${{ github.repository }} | grep ${{ env.app_name }}-.* >/dev/null 2>&1 || echo "app_build=1" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    if: needs.check.outputs.app_build == '1'
+    runs-on: ubuntu-latest
+    needs: check
+    env:
+      app_version: ${{ needs.check.outputs.app_version }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.app_repo }}
+          ref: ${{ env.app_version }}
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: Build binaries
+        run: |
+          ARCH="amd64 arm arm64 loong64 ppc64le riscv64 s390x"
+          mkdir -p build
+          cd corefile-tool; for arch in ${ARCH}; do
+            GO111MODULE=on GOOS=linux GOARCH=$arch go build -o ../build/corefile-tool-$arch
+            shasum -a 256 ../build/corefile-tool-$arch > ../build/corefile-tool-$arch.sha256
+          done
+
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="${{ env.app_version }}"
+          gh release create "${TAG_NAME}" \
+            --repo ${{ github.repository }} \
+            --generate-notes \
+            --title "${TAG_NAME}" \
+            build/*
